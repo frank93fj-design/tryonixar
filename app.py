@@ -11,7 +11,6 @@ import time as _time
 app = Flask(__name__)
 
 # ── CLOUD CONFIG ──
-# Updated to match your JSON key exactly
 PROJECT_ID = "tryonixar-494001"
 LOCATION = "us-central1"
 
@@ -19,15 +18,44 @@ LOCATION = "us-central1"
 _gcp_json = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON")
 
 if _gcp_json:
+    print(f"DEBUG: Raw env var length: {len(_gcp_json)}")
+    print(f"DEBUG: First 50 chars: {repr(_gcp_json[:50])}")
     try:
-        # Repairing newline escaping for Railway environment variables
-        formatted_json = _gcp_json.replace('\\n', '\n')
-        
+        # Attempt 1: direct parse
+        try:
+            json.loads(_gcp_json)
+            formatted_json = _gcp_json
+            print("DEBUG: Direct parse succeeded")
+        except json.JSONDecodeError:
+            print("DEBUG: Direct parse failed, trying newline fix...")
+            formatted_json = _gcp_json.replace('\\n', '\n')
+            try:
+                json.loads(formatted_json)
+                print("DEBUG: Newline-fix parse succeeded")
+            except json.JSONDecodeError:
+                print("DEBUG: Newline-fix failed, trying base64...")
+                try:
+                    formatted_json = base64.b64decode(_gcp_json).decode('utf-8')
+                    json.loads(formatted_json)
+                    print("DEBUG: Base64 decode succeeded")
+                except Exception as b64_err:
+                    print(f"DEBUG: Base64 failed: {b64_err}")
+                    raise ValueError("All parsing strategies failed")
+
         _tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
         _tmp.write(formatted_json)
+        _tmp.flush()
         _tmp.close()
+
+        # Verify the file was written correctly
+        with open(_tmp.name, 'r') as f:
+            content = f.read()
+        print(f"DEBUG: Written file length: {len(content)}")
+        json.loads(content)  # validate
+        print("DEBUG: Written file is valid JSON")
+
         os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = _tmp.name
-        print(f"Vertex AI credentials file created successfully.")
+        print(f"DEBUG: Credentials path set to {_tmp.name}")
     except Exception as e:
         print(f"FAILED to create credentials file: {e}")
 else:
@@ -178,7 +206,6 @@ def upload_file():
         person_img = Image.from_file(location=user_img_path)
         person_ref = RawReferenceImage(reference_image=person_img, reference_id=0)
 
-        # RESTORED: Your original deep prompt structure
         prompt = (
             "TASK: Photorealistic virtual clothing try-on.\n"
             "A reference photo of a specific real person is provided. "
