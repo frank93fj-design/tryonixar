@@ -130,7 +130,8 @@ def generate_3d():
     user_img_path = os.path.join(UPLOAD_FOLDER, 'user_base.jpg')
     photo.save(user_img_path)
 
-    headers = {'Authorization': f'Bearer {MESHY_API_KEY}'}
+    api_key = os.environ.get("MESHY_API_KEY")
+    headers = {'Authorization': f'Bearer {api_key}'}
 
     try:
         with open(user_img_path, 'rb') as f:
