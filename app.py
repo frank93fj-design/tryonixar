@@ -6,6 +6,7 @@ from flask import Flask, render_template, request, jsonify
 from google import genai
 from google.genai.types import RawReferenceImage, EditImageConfig, Image
 import tempfile
+import time as _time
 
 app = Flask(__name__)
 
@@ -27,11 +28,18 @@ client = genai.Client(
     project=PROJECT_ID,
     location=LOCATION,
 )
-print(f"Vertex AI (google-genai SDK) initialized: {PROJECT_ID}")
+print(f"Vertex AI initialized: {PROJECT_ID}")
 
 # ── MESHY CONFIG ──
-MESHY_API_KEY = os.environ.get("MESHY_API_KEY", "YOUR_MESHY_API_KEY_HERE")
+# Pulling directly from environment; removed hardcoded fallback for security
+MESHY_API_KEY = os.environ.get("MESHY_API_KEY")
 MESHY_BASE_URL = "https://api.meshy.ai/openapi/v1"
+
+# Debug Check: This will show in your Railway logs (logs are private to you)
+if not MESHY_API_KEY:
+    print("WARNING: MESHY_API_KEY is not set in environment variables!")
+else:
+    print(f"Meshy API Key loaded: {MESHY_API_KEY[:5]}***")
 
 UPLOAD_FOLDER = 'static/uploads'
 MODELS_FOLDER = 'static/uploads/models'
@@ -44,33 +52,16 @@ os.makedirs(WARDROBE_FOLDER, exist_ok=True)
 ALLOWED_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.webp'}
 ALLOWED_MODEL_EXTENSIONS = {'.glb'}
 
-
 def get_wardrobe_items():
     return [
         f for f in os.listdir(WARDROBE_FOLDER)
         if os.path.splitext(f)[1].lower() in ALLOWED_EXTENSIONS
     ]
 
-
 def filename_to_garment_description(filename: str) -> str:
-    """
-    Converts a detailed garment filename into a rich natural-language description.
-
-    Examples:
-        white-hoodie-long-sleeve.png   -> "white hoodie with long sleeves"
-        black-slim-fit-jeans.png       -> "black slim fit jeans"
-        red-floral-summer-dress.png    -> "red floral summer dress"
-        navy-crew-neck-short-sleeve.png -> "navy crew neck with short sleeves"
-
-    Strategy:
-      1. Strip extension, split on hyphens and underscores.
-      2. Detect sleeve/length qualifier tokens and rewrite as a natural subordinate clause.
-      3. Join remaining tokens into a coherent phrase.
-    """
     stem = os.path.splitext(filename)[0]
     tokens = stem.replace('_', '-').split('-')
 
-    # Multi-word sleeve/length qualifiers -> natural clause
     sleeve_map = {
         ('long', 'sleeve'):  'with long sleeves',
         ('short', 'sleeve'): 'with short sleeves',
@@ -96,14 +87,11 @@ def filename_to_garment_description(filename: str) -> str:
             break
 
     base_description = ' '.join(remaining)
-
     if not sleeve_clause:
         return base_description
-    # Prepend qualifiers that work as adjectives; append the rest as a clause
     if sleeve_clause in ('sleeveless', 'cropped', 'oversized'):
         return f"{sleeve_clause} {base_description}"
     return f"{base_description} {sleeve_clause}"
-
 
 # ── ROUTES ──
 
@@ -111,14 +99,15 @@ def filename_to_garment_description(filename: str) -> str:
 def index():
     return render_template('index.html')
 
-
 @app.route('/wardrobe')
 def wardrobe():
     return render_template('Wardrobe.html', wardrobe_items=get_wardrobe_items())
 
-
 @app.route('/generate_3d', methods=['POST'])
 def generate_3d():
+    if not MESHY_API_KEY:
+        return jsonify({'error': 'Meshy API key missing on server'}), 500
+
     photo = request.files.get('photo')
     if not photo:
         return jsonify({'error': 'No photo provided'}), 400
@@ -130,8 +119,7 @@ def generate_3d():
     user_img_path = os.path.join(UPLOAD_FOLDER, 'user_base.jpg')
     photo.save(user_img_path)
 
-    api_key = os.environ.get("MESHY_API_KEY")
-    headers = {'Authorization': f'Bearer {api_key}'}
+    headers = {'Authorization': f'Bearer {MESHY_API_KEY}'}
 
     try:
         with open(user_img_path, 'rb') as f:
@@ -149,10 +137,12 @@ def generate_3d():
         job_id = job_data.get('result') or job_data.get('id')
         return jsonify({'job_id': job_id})
 
+    except requests.exceptions.HTTPError as e:
+        print(f"Meshy API HTTP Error: {e.response.status_code} - {e.response.text}")
+        return jsonify({'error': f"Meshy API Error: {e.response.status_code}"}), e.response.status_code
     except Exception as e:
         print(f"Meshy generate_3d error: {e}")
         return jsonify({'error': str(e)}), 500
-
 
 @app.route('/meshy_status/<job_id>', methods=['GET'])
 def meshy_status(job_id):
@@ -185,7 +175,6 @@ def meshy_status(job_id):
         print(f"Meshy status poll error: {e}")
         return jsonify({'error': str(e), 'status': 'UNKNOWN'}), 500
 
-
 @app.route('/upload_glb', methods=['POST'])
 def upload_glb():
     glb_file = request.files.get('glbFile')
@@ -202,23 +191,8 @@ def upload_glb():
 
     return jsonify({'success': True, 'url': f'/static/uploads/models/{safe_name}'})
 
-
 @app.route('/upload', methods=['POST'])
 def upload_file():
-    """
-    Vertex AI Imagen try-on.
-
-    v2 improvements:
-      - filename_to_garment_description() converts detailed filenames like
-        'white-hoodie-long-sleeve' into natural prose for the prompt.
-      - Prompt restructured as a numbered constraint list, which reduces
-        Imagen's variance and hallucination rate.
-      - Explicit FORBIDDEN section suppresses the most common failure modes:
-        face changes, background drift, colour substitution.
-      - garment_used echoed back in the JSON response for frontend debugging.
-    """
-    import time as _time
-
     file = request.files.get('imageUpload')
     selected_items_str = request.form.get('selectedItems', '[]')
 
@@ -241,49 +215,22 @@ def upload_file():
     garment_filename = selected_list[0]
     garment_description = filename_to_garment_description(garment_filename)
 
-    print(f"Garment filename : '{garment_filename}'")
-    print(f"Garment description : '{garment_description}'")
-
     try:
         person_img = Image.from_file(location=user_img_path)
         person_ref = RawReferenceImage(reference_image=person_img, reference_id=0)
 
-        # ── STRUCTURED PROMPT ──────────────────────────────────────────────────
-        # Numbered rules consistently outperform free-form prose for Imagen
-        # edit_image because each constraint is isolated and cannot bleed into
-        # neighbouring instructions.
         prompt = (
             "TASK: Photorealistic virtual clothing try-on.\n"
             "A reference photo of a specific real person is provided. "
             "Generate an output image that is identical to the reference in every respect "
             f"except that the person is now wearing a {garment_description}.\n\n"
             "STRICT RULES — obey every rule without exception:\n"
-            "1. IDENTITY PRESERVATION: The person's face, skin tone, eye colour, "
-            "facial structure, hair colour, and hair style must be an exact match "
-            "to the reference photograph. Do not alter the face in any way.\n"
-            "2. POSE & BODY: Maintain the same body shape, proportions, stance, "
-            "and pose as shown in the reference.\n"
-            "3. BACKGROUND: Reproduce the background, environment, lighting direction, "
-            "and colour temperature exactly as in the reference.\n"
-            f"4. GARMENT — what to show: Dress the person in a {garment_description}. "
-            "The garment must drape and fit naturally on the body, obey fabric physics, "
-            "and be lit consistently with the rest of the scene.\n"
-            f"5. GARMENT — colour and style fidelity: The {garment_description} must "
-            "retain its precise colour, texture, and silhouette as implied by the name. "
-            "Do not substitute a different colour or style.\n"
-            "6. SCOPE OF CHANGE: Replace only the clothing that the garment would cover. "
-            "Preserve all other visible details (accessories, shoes, etc.) unless they "
-            "are naturally concealed by the new garment.\n"
-            "FORBIDDEN (never do any of these):\n"
-            "- Do not generate a different or composite person.\n"
-            "- Do not modify the face, hair, or skin tone.\n"
-            "- Do not change or reinterpret the background.\n"
-            "- Do not change the garment colour to something not described.\n"
-            "- Do not add clothing items that were not requested.\n\n"
+            "1. IDENTITY PRESERVATION: Keep face, hair, and skin exactly as in reference.\n"
+            "2. POSE & BODY: Maintain the same stance.\n"
+            "3. BACKGROUND: Keep the background identical.\n"
+            f"4. GARMENT: Dress the person in a {garment_description}.\n"
             "Output: one single photorealistic image."
         )
-
-        print("Calling Vertex AI Imagen edit_image…")
 
         result = client.models.edit_image(
             model='imagen-3.0-capability-001',
@@ -297,7 +244,6 @@ def upload_file():
 
         final_ai_path = os.path.join(UPLOAD_FOLDER, 'ai_preview.jpg')
         result.generated_images[0].image.save(location=final_ai_path)
-        print("Try-on complete!")
 
         cache_bust = int(_time.time())
         return jsonify({
@@ -310,6 +256,7 @@ def upload_file():
         print(f"VERTEX ERROR: {e}")
         return jsonify({'success': False, 'error': f"AI Tailor Failed: {str(e)}"}), 500
 
-
 if __name__ == '__main__':
-    app.run(debug=True, port=5001)
+    # Railway usually provides a PORT env var, but local uses 5001
+    port = int(os.environ.get("PORT", 5001))
+    app.run(host='0.0.0.0', port=port)
